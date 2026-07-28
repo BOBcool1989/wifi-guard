@@ -55,6 +55,13 @@ CHECK_INTERVAL = 15
 # 不宜过长：连接命令被系统接受后，通常 3-5 秒就能建立关联并拿到 IP。
 CONNECT_WAIT = 5
 
+# 单次连接最长等待秒数：每 1 秒查一次网卡状态，connected 即停止等待。
+# 这样既不会刚"正在连接"就切下一个，也不会死等。
+CONNECT_MAX_WAIT = 20
+
+# 整个候选列表最多重试几轮（给瞬态故障容错，不能一次失败就放弃）。
+MAX_ROUNDS = 3
+
 # 联网探测使用的地址：
 #   - gstatic 的 generate_204 在“真能上网”时返回 HTTP 204，最可靠；
 #   - 百度 HTTPS 成功说明没有被 captive portal（认证页）拦截。
@@ -219,6 +226,54 @@ def get_saved_profiles():
     return profiles
 
 
+def get_signal_map():
+    """
+    扫描当前可见的 WiFi，返回 {ssid: 信号百分比(0-100)}。
+    netsh wlan show networks mode=bssid 输出含多段 SSID 块，每段有 Signal 行。
+    用于给候选网按信号强弱排序，优先连信号好的。
+    扫不到的网返回值缺省，排序时按 0 处理。
+
+    注意：netsh 输出里 SSID 块标题形如 "SSID 1 : xxx"，key 是 "ssid 1"，
+    所以这里用 startswith("ssid") 判断，而不是精确匹配。
+    """
+    out = run_cmd("netsh wlan show networks mode=bssid")
+    sig_map = {}
+    cur_ssid = None
+    for line in out.splitlines():
+        key, val = _split_kv(line)
+        if key is None:
+            continue
+        # SSID 块标题：key 形如 "ssid 1" / "ssid 2"，用 startswith 识别
+        if key.startswith("ssid") and val:
+            cur_ssid = val
+            sig_map.setdefault(cur_ssid, 0)
+        elif key in ("signal", "信号") and cur_ssid and val:
+            # 形如 "86%"，取数字
+            pct = val.replace("%", "").replace("％", "").strip()
+            try:
+                sig_map[cur_ssid] = max(sig_map.get(cur_ssid, 0), int(pct))
+            except ValueError:
+                pass
+    log.info("可见网络信号: %s", sig_map)
+    return sig_map
+
+
+def sort_profiles_by_signal(profiles):
+    """
+    把已保存的配置文件列表按信号强度降序排列。
+    信号好的优先试，搜不到的（sig 缺省）按 0 排在后面、保持原相对顺序。
+    """
+    sig = get_signal_map()
+    # 稳定排序：先按是否可见分桶，可见的按信号降序，不可见的保持原序
+    visible = [(s, sig.get(s, 0)) for s in profiles if s in sig]
+    invisible = [s for s in profiles if s not in sig]
+    visible.sort(key=lambda x: x[1], reverse=True)
+    ordered = [s for s, _ in visible] + invisible
+    log.info("按信号排序后候选: %s",
+             [(s, sig.get(s, 0)) for s in ordered])
+    return ordered
+
+
 def connect_wifi(ssid):
     """
     尝试连接到指定 SSID（需已保存过密码）。
@@ -259,6 +314,32 @@ def connect_wifi(ssid):
     except Exception as e:
         log.warning("连接异常: ssid=%s %s", ssid, e)
         return False
+
+
+def wait_for_connection(target_ssid, max_wait=CONNECT_MAX_WAIT):
+    """
+    连接命令发出后，轮询网卡状态，等到真正 connected 且 SSID 变成目标网。
+    每 1 秒查一次，避免"刚发出连接就切下一个"的问题。
+    返回 True 表示已连上目标网，False 表示超时仍未连上。
+    """
+    log.info("等待连接 %s（最长 %s 秒）...", target_ssid, max_wait)
+    for i in range(max_wait):
+        time.sleep(1)
+        iface = get_wlan_interface()
+        if iface is None:
+            continue
+        st = (iface.get("state") or "").lower()
+        ssid = iface.get("ssid")
+        if "connected" in st and ssid == target_ssid:
+            log.info("✓ 已连上 %s（第 %d 秒）", target_ssid, i + 1)
+            return True
+        if "connected" in st and ssid and ssid != target_ssid:
+            # 连上了别的网，可能 Windows 自动连的，也算失败
+            log.info("连上了 %s 而非 %s，视为失败", ssid, target_ssid)
+            return False
+        # 否则继续等（disconnected / associating 等）
+    log.warning("等待 %s 超时（%s 秒未连上）", target_ssid, max_wait)
+    return False
 
 
 def check_internet():
@@ -309,8 +390,9 @@ def check_internet():
 def ensure_connectivity():
     """
     保证联网：当前若能上网直接返回 True；
-    否则把当前（失败）SSID 拉黑，依次尝试其它已保存 WiFi，直到恢复。
-    本函数会一次性遍历所有候选网，避免每轮只切一次造成长时间断网。
+    否则把当前（失败）SSID 拉黑，按信号强度排序依次尝试其它已保存 WiFi。
+    整个候选列表跑 MAX_ROUNDS 轮（默认 3 轮），给瞬态故障容错。
+    每个网连完用 wait_for_connection 等真连上再探测，避免切换太快。
     """
     log.info("=== ensure_connectivity 开始 ===")
     if check_internet():
@@ -326,50 +408,55 @@ def ensure_connectivity():
 
     current = get_current_ssid()
     log.info("当前 SSID: %s", current)
-    if current:
-        blacklist.add(current)  # 当前网连着却上不了网，加入黑名单
-        log.info("拉黑当前网: %s", current)
 
-    # 若所有已保存网络都在黑名单里，重置以便本轮重新尝试
-    if set(profiles) <= blacklist:
-        log.info("所有网都在黑名单，重置黑名单")
+    # 跑 MAX_ROUNDS 轮，每轮清黑名单重来（但本轮内仍记录失败的网避免重复试）
+    for round_no in range(1, MAX_ROUNDS + 1):
+        log.info("====== 第 %d/%d 轮 ======", round_no, MAX_ROUNDS)
+        # 按信号强度排序候选（每轮重新扫，信号会变）
+        ordered = sort_profiles_by_signal(profiles)
+
+        for candidate in ordered:
+            if state["stop"]:
+                return False
+            # 本轮内已试过失败的跳过；当前网也跳过
+            if candidate in blacklist or candidate == current:
+                log.debug("跳过(黑名单或当前): %s", candidate)
+                continue
+            log.info("尝试: %s", candidate)
+            set_status(f"切换至 {candidate}…", "yellow")
+            # 先看连接命令本身是否被系统接受
+            cmd_ok = connect_wifi(candidate)
+            if not cmd_ok:
+                # 配置文件不可用，本轮跳过，下轮重试
+                log.info("连接命令被拒，跳过: %s", candidate)
+                blacklist.add(candidate)
+                continue
+            # 命令接受了，轮询等真正 connected（最长 CONNECT_MAX_WAIT 秒）
+            connected = wait_for_connection(candidate)
+            if not connected:
+                log.info("✗ %s 未能在超时内连上，拉黑继续", candidate)
+                blacklist.add(candidate)
+                continue
+            # 已连上目标网，探测是否真联网
+            if check_internet():
+                blacklist.clear()
+                log.info("✓✓ 切换成功并联网: %s", candidate)
+                return True
+            log.info("✗ %s 连上但仍无法联网，拉黑继续", candidate)
+            blacklist.add(candidate)
+
+        # 本轮所有候选都失败，清空黑名单准备下一轮重来
+        log.warning("第 %d 轮全部失败，清空黑名单准备下一轮", round_no)
         blacklist.clear()
-        # 重置后仍把当前网拉黑，避免立刻又切回刚才失败的网
+        # 下一轮仍把"当前连着的失败网"拉黑，避免立刻切回
         if current:
             blacklist.add(current)
+        # 轮间小憩，给无线服务喘口气
+        if round_no < MAX_ROUNDS:
+            log.info("轮间等待 3 秒...")
+            time.sleep(3)
 
-    # 依次尝试每个尚未拉黑的网络，连一个测一个，直到成功
-    tried = 0
-    for candidate in profiles:
-        if candidate in blacklist or candidate == current:
-            log.debug("跳过(黑名单或当前): %s", candidate)
-            continue
-        tried += 1
-        log.info("尝试第 %d 个候选: %s", tried, candidate)
-        set_status(f"切换至 {candidate}…", "yellow")
-        # 先看连接命令本身是否被系统接受
-        cmd_ok = connect_wifi(candidate)
-        if not cmd_ok:
-            # 配置文件不可用（已删除/接口不匹配），拉黑跳过，不白等
-            log.info("连接命令被拒，拉黑跳过: %s", candidate)
-            blacklist.add(candidate)
-            continue
-        # 命令接受了，等网卡建立连接并获取 IP
-        log.info("连接命令成功，等待 %s 秒...", CONNECT_WAIT)
-        time.sleep(CONNECT_WAIT)
-        # 连接后重新读状态
-        new_iface = get_wlan_interface()
-        new_ssid = new_iface.get("ssid") if new_iface else None
-        log.info("等待后状态: ssid=%s state=%s", new_ssid,
-                 new_iface.get("state") if new_iface else None)
-        if check_internet():
-            blacklist.clear()
-            log.info("✓ 切换成功并联网: %s", candidate)
-            return True
-        log.info("✗ %s 连上但仍无法联网，拉黑继续", candidate)
-        blacklist.add(candidate)  # 这个网也不行，拉黑继续下一个
-
-    log.warning("所有候选网尝试完毕，均无法联网。共尝试 %d 个", tried)
+    log.warning("====== %d 轮全部尝试完毕，均无法联网 ======", MAX_ROUNDS)
     return False
 
 
