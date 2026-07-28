@@ -57,7 +57,7 @@ CONNECT_WAIT = 5
 
 # 单次连接最长等待秒数：每 1 秒查一次网卡状态，connected 即停止等待。
 # 这样既不会刚"正在连接"就切下一个，也不会死等。
-CONNECT_MAX_WAIT = 20
+CONNECT_MAX_WAIT = 10
 
 # 整个候选列表最多重试几轮（给瞬态故障容错，不能一次失败就放弃）。
 MAX_ROUNDS = 3
@@ -258,16 +258,23 @@ def get_signal_map():
     return sig_map
 
 
-def sort_profiles_by_signal(profiles):
+def sort_profiles_by_signal(profiles, visible_only=True):
     """
     把已保存的配置文件列表按信号强度降序排列。
     信号好的优先试，搜不到的（sig 缺省）按 0 排在后面、保持原相对顺序。
+    若 visible_only=True，只返回当前可见的网络（排除扫不到的），避免盲连不存在的 WiFi。
     """
     sig = get_signal_map()
     # 稳定排序：先按是否可见分桶，可见的按信号降序，不可见的保持原序
     visible = [(s, sig.get(s, 0)) for s in profiles if s in sig]
     invisible = [s for s in profiles if s not in sig]
     visible.sort(key=lambda x: x[1], reverse=True)
+    if visible_only:
+        ordered = [s for s, _ in visible]
+        log.info("按信号排序后候选（仅可见）: %s",
+                 [(s, sig.get(s, 0)) for s in ordered])
+        log.info("已排除不可见网络 (%d个): %s", len(invisible), invisible)
+        return ordered
     ordered = [s for s, _ in visible] + invisible
     log.info("按信号排序后候选: %s",
              [(s, sig.get(s, 0)) for s in ordered])
@@ -412,8 +419,12 @@ def ensure_connectivity():
     # 跑 MAX_ROUNDS 轮，每轮清黑名单重来（但本轮内仍记录失败的网避免重复试）
     for round_no in range(1, MAX_ROUNDS + 1):
         log.info("====== 第 %d/%d 轮 ======", round_no, MAX_ROUNDS)
-        # 按信号强度排序候选（每轮重新扫，信号会变）
+        # 按信号强度排序候选（每轮重新扫，信号会变；默认只看可见网络）
         ordered = sort_profiles_by_signal(profiles)
+        log.info("本轮候选 (%d个): %s", len(ordered), ordered)
+        if not ordered:
+            log.warning("本轮无可尝试的WiFi（可见网络与已保存配置无交集）")
+            continue
 
         for candidate in ordered:
             if state["stop"]:
