@@ -1,0 +1,29 @@
+# 构建产物
+build/
+build*/
+dist/
+dist2/
+*.spec
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 日志
+*.log
+
+# 临时测试脚本（保留 test_logic.py 作为示例，其余忽略）
+test_disconnect.py
+test_real.py
+test_ssid_stable.py
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
